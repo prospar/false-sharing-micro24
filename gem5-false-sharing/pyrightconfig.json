@@ -1,0 +1,13 @@
+{
+  "exclude": ["**/node_modules", "**/__pycache__"],
+  "ignore": ["**/node_modules", "**/__pycache__"],
+  "include": ["src/python", "ext/ply"],
+  "pythonPlatform": "Linux",
+  "pythonVersion": "3.6",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "stubPath": "typings",
+  "typeCheckingMode": "basic",
+  "venvPath": "/home/swarnendu/tmp/virtualenvs",
+  "venv": "fs-python2-venv"
+}

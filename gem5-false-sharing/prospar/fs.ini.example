@@ -1,0 +1,16 @@
+# https://docs.python.org/3.6/library/configparser.html
+# Use a list to pass multiple values if needed (e.g., emails).
+# Duplicate keys are not allowed in a section.
+
+[PROJECT]
+BENCHMARKS_ROOT = /data/swarnendu/false-sharing-benchmarks
+FS_GEM5_ROOT = /data/swarnendu/gem5-false-sharing
+VIRTUALENV_ROOT = /home/swarnendu/tmp/virtualenvs/fs-python2-venv
+EXP_OUTPUT_ROOT = /data/swarnendu/gem5-false-sharing/output
+
+[SYSTEM]
+PROTOCOL = MESI_Two_Level
+
+[USER]
+USER = swarnendu
+EMAIL = swarnendu@cse.iitk.ac.in

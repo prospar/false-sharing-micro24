@@ -1,0 +1,7 @@
+protocol "FS_MESI_DETECTION_Blocking";
+include "RubySlicc_interfaces.slicc";
+include "FS_MESI_DETECTION_Blocking-msg.sm";
+include "FS_MESI_DETECTION_Blocking-L1cache.sm";
+include "FS_MESI_DETECTION_Blocking-L2cache.sm";
+include "FS_MESI_DETECTION_Blocking-dir.sm";
+include "FS_MESI_DETECTION_Blocking-dma.sm";

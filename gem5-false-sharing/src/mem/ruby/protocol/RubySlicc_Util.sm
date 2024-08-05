@@ -1,0 +1,149 @@
+
+/*
+ * Copyright (c) 1999-2005 Mark D. Hill and David A. Wood
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+// Miscallaneous Functions
+
+void error(std::string msg);
+void assert(bool condition);
+Cycles zero_time();
+NodeID intToID(int nodenum);
+int IDToInt(NodeID id);
+int addressToInt(Addr addr);
+Addr intToAddress(int addr);
+int max_tokens();
+Addr makeLineAddress(Addr addr);
+int getOffset(Addr addr);
+int mod(int val, int mod);
+Addr bitSelect(Addr addr, int small, int big);
+Addr maskLowOrderBits(Addr addr, int number);
+Addr makeNextStrideAddress(Addr addr, int stride);
+structure(BoolVec, external="yes") {
+}
+int countBoolVec(BoolVec bVec);
+
+// FalseSharing: Structure added to remove circular dependency
+structure(FSPerCoreStateEntry, external= "yes") {
+  BoolVec blockAccessRead;
+  BoolVec blockAccessWrite;
+  bool sendMDonEviction;
+  bool setByteAccess(int, bool, bool);
+  bool getByteAccess(int, bool);
+  bool getsendAccessMD();
+  void setsendAccessMD(bool);
+}
+
+// FalseSharing:  Optional Metadata table
+structure(FSOptionalPerCoreState, external="yes") {
+  void addOptionalMetadataEntry(Addr);
+  FSPerCoreStateEntry getBlockAccess(Addr);
+  void updateOptionalMetadataEntry(Addr, int, bool);
+  void removeOptionalMetadataEntry(Addr);
+  bool validMetadataEntry(Addr);
+  bool checkOverlapAccess(bool, Addr, int);
+  void resetMetadataEntry(Addr);
+  void addOptionalMetadataEntry(Addr, FSPerCoreStateEntry);
+  bool accessToNewBytes(Addr, int, RubyRequestType);
+  void updateMDCommBit(Addr, bool);
+  bool getMDCommBit(Addr);
+  Scalar prv_wr;
+  Scalar prv_rd;
+  Scalar evc_shared;
+  Scalar evc_owner;
+  Scalar prv_replacement;
+}
+
+//FalseSharing: Eviction MD cache
+structure(FSEvictionMDCache, external="yes") {
+  void addEvictionMDEntry(Addr);
+  void removeEvictionMDEntry(Addr);
+  bool isMDEntryPresent(Addr);
+}
+
+
+external_type(IntVec);
+
+// FalseSharing: Structure for storing access MD for a byte
+structure (FSGAEntry, external="yes") {
+  int getLastWriterID();
+  void setLastWriterID(int);
+  IntVec getSharerIDs();
+  void setSharerIDs(IntVec);
+  void updateSharer(int);
+  void resetSharerIDs();
+  void removeSharer(int);
+}
+
+structure(PerBlockEntry, external="yes") {
+
+}
+
+// FalseSharing: Declaration of Global ACT table
+structure (FSGlobalACT, external="yes") {
+  int act_size;
+  Addr getMaxAddrValue();
+  void setFSGAEntry(Addr, int, MachineID, bool);
+  Addr updateFSGAEntry(Addr, FSPerCoreStateEntry, MachineID);
+  void removeFSGAEntry(Addr);
+  bool blockEntryExists(Addr);
+  FSPerCoreStateEntry getAccessMetadata(Addr, MachineID);
+  bool checkPrivatizationStatus(Addr, Addr);
+  void updateGAEntryonRequest(Addr, int, MachineID, bool);
+  WriteMask generateMask(Addr, MachineID);
+  WriteMask generateMaskForMetadata(Addr, MachineID, PerBlockEntry);
+  PerBlockEntry getGAEntry(Addr);
+  bool checkAccessConflict(Addr, int, MachineID, bool);
+  bool checkTrueSharingBit(Addr);
+  void resetMetadataEntry(Addr);
+  void resetMetadataEntryForCore(Addr, MachineID);
+  void reportFSInst(Addr inst_pc);
+  void resetMetadataonPrivatization(Addr addr);
+  void reportFSVAdrr(PacketPtr virtPkt);
+  bool isKernelAddr(Addr inst_pc);
+
+  // stats for MD
+  Scalar metadata_msg;
+  Scalar control_metadata_msg;
+  Scalar total_metadata_msg;
+  Scalar eviction_metadata_msg;
+  // stats for area and energy
+  // FalseSharing : Do not delete might use later
+  Scalar sm_read; // total read to shared access md
+  Scalar sm_write; // total write to shared access md
+  Scalar prv_line;
+  Scalar total_term;
+  Scalar term_cnft;
+  Scalar term_dir_ev;
+  Scalar term_sam_ev;
+  Scalar imm_prv_term;
+  Scalar succ_prv_line;
+  Scalar evc_prv_entry;
+  Scalar prv_ts_bit;
+  Scalar prv_hys_cnt;
+  Scalar total_false_sharing_accesses;
+}

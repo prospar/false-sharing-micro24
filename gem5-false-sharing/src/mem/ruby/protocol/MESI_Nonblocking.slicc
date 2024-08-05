@@ -1,0 +1,7 @@
+protocol "MESI_Nonblocking";
+include "RubySlicc_interfaces.slicc";
+include "MESI_Nonblocking-msg.sm";
+include "MESI_Nonblocking-L1cache.sm";
+include "MESI_Nonblocking-L2cache.sm";
+include "MESI_Nonblocking-dir.sm";
+include "MESI_Nonblocking-dma.sm";

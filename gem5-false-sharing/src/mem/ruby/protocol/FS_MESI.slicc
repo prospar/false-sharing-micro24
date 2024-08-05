@@ -1,0 +1,7 @@
+protocol "FS_MESI";
+include "RubySlicc_interfaces.slicc";
+include "FS_MESI-msg.sm";
+include "FS_MESI-L1cache.sm";
+include "FS_MESI-L2cache.sm";
+include "FS_MESI-dir.sm";
+include "FS_MESI-dma.sm";

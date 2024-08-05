@@ -1,0 +1,7 @@
+protocol "DETECT_MD";
+include "RubySlicc_interfaces.slicc";
+include "DETECT_MD-msg.sm";
+include "DETECT_MD-L1cache.sm";
+include "DETECT_MD-L2cache.sm";
+include "DETECT_MD-dir.sm";
+include "DETECT_MD-dma.sm";

@@ -1,0 +1,1634 @@
+/*
+ * Copyright (c) 2020 ARM Limited
+ * All rights reserved
+ *
+ * The license below extends only to copyright in the software and shall
+ * not be construed as granting a license to any other intellectual
+ * property including but not limited to intellectual property relating
+ * to a hardware implementation of the functionality of the software
+ * licensed hereunder.  You may use the software subject to the license
+ * terms below provided that you ensure that this notice is replicated
+ * unmodified and in its entirety in all distributions of the software,
+ * modified or unmodified, in source code or in binary form.
+ *
+ * Copyright (c) 1999-2013 Mark D. Hill and David A. Wood
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ : CacheMemory * L2cache; // FalseSharing: Holds the cache data/entries
+   Cycles l2_request_latency := 2;
+   Cycles l2_response_latency := 2;
+   Cycles to_l1_latency := 1;
+   FSGlobalACT * FSGlobalACTData; // FalseSharing: Access tracking data structure
+   int fetch_threshold; // FalseSharing: fetch threshold
+   int inv_threshold; // FalseSharing: invalidation threshold
+   int hys_threshold; // FalseSharing: hysteresis threshold
+   int saturation_threshold; // FalseSharing: once any of IC/FC reaches saturation, reset both
+  // FalseSharing: Message buffers are the interface between the state machine and the Ruby
+  // network. Messages are sent and received via the message buffers. Thus, for each virtual
+  // channel in our protocol we need a separate message buffer.
+  //  Virtual networks are needed to prevent deadlock
+
+  // Message Queues
+  // From local bank of L2 cache TO the network
+  MessageBuffer * DirRequestFromL2Cache, network="To", virtual_network="0",
+    vnet_type="request";  // this L2 bank -> Memory
+
+  MessageBuffer * L1RequestFromL2Cache, network="To", virtual_network="2",
+    vnet_type="request";  // this L2 bank -> a local L1
+
+  MessageBuffer * responseFromL2Cache, network="To", virtual_network="1",
+    vnet_type="response";  // this L2 bank -> a local L1 || Memory
+
+  // FROM the network to this local bank of L2 cache
+  MessageBuffer * unblockToL2Cache, network="From", virtual_network="2",
+    vnet_type="unblock";  // a local L1 || Memory -> this L2 bank
+
+  MessageBuffer * L1RequestToL2Cache, network="From", virtual_network="0",
+    vnet_type="request";  // a local L1 -> this L2 bank
+
+  MessageBuffer * responseToL2Cache, network="From", virtual_network="1",
+    vnet_type="response";  // a local L1 || Memory -> this L2 bank
+{
+  // STATES
+  state_declaration(State, desc="L2 Cache states", default="L2Cache_State_NP") {
+    // Base states
+    NP, AccessPermission:Invalid, desc="Not present in either cache";
+    SS, AccessPermission:Read_Only, desc="L2 cache entry Shared, also present in one or more L1s";
+    M, AccessPermission:Read_Write, desc="L2 cache entry Modified, not present in any L1s", format="!b";
+    MT, AccessPermission:Maybe_Stale, desc="L2 cache entry Modified in a local L1, assume L2 copy stale", format="!b";
+
+    // L2 replacement
+    M_I, AccessPermission:Busy, desc="L2 cache replacing, have all acks, sent dirty data to memory, waiting for ACK from memory";
+    MT_I, AccessPermission:Busy, desc="L2 cache replacing, getting data from exclusive";
+    MCT_I, AccessPermission:Busy, desc="L2 cache replacing, clean in L2, getting data or ack from exclusive";
+    I_I, AccessPermission:Busy, desc="L2 replacing clean data, need to inv sharers and then drop data";
+    S_I, AccessPermission:Busy, desc="L2 replacing dirty data, collecting acks from L1s";
+
+    // Transient States for fetching data from memory
+    ISS, AccessPermission:Busy, desc="L2 idle, got single L1_GETS, issued memory fetch, have not seen response yet";
+    IS, AccessPermission:Busy, desc="L2 idle, got L1_GET_INSTR or multiple L1_GETS, issued memory fetch, have not seen response yet";
+    IM, AccessPermission:Busy, desc="L2 idle, got L1_GETX, issued memory fetch, have not seen response(s) yet";
+
+    // Blocking states
+    SS_MB, AccessPermission:Busy, desc="Blocked for L1_GETX from SS";
+    MT_MB, AccessPermission:Busy, desc="Blocked for L1_GETX from MT";
+
+    MT_IIB, AccessPermission:Busy, desc="Blocked for L1_GETS from MT, waiting for unblock and data";
+    MT_IB, AccessPermission:Busy, desc="Blocked for L1_GETS from MT, got unblock, waiting for data";
+    MT_SB, AccessPermission:Busy, desc="Blocked for L1_GETS from MT, got data,  waiting for unblock";
+
+    // FalseSharing: state for privatization
+    MDW_M, AccessPermission:Busy, desc="Waiting for all metadata update, block in modify state";
+    MDW_S, AccessPermission:Busy, desc="Waiting for pending MD update, block in shared state";
+  }
+
+  // EVENTS
+  enumeration(Event, desc="L2 Cache events") {
+    // L2 events
+
+    // events initiated by the local L1s
+    L1_GET_INSTR,            desc="a L1I GET INSTR request for a block mapped to us";
+    L1_GETS,                 desc="a L1D GETS request for a block mapped to us";
+    L1_GETX,                 desc="a L1D GETX request for a block mapped to us";
+    L1_UPGRADE,              desc="a L1D GETX request for a block mapped to us";
+
+    L1_PUTX,                 desc="L1 replacing data";
+    L1_PUTX_old,             desc="L1 replacing data, but no longer sharer";
+
+    // events initiated by this L2
+    L2_Replacement,     desc="L2 Replacement", format="!r";
+    L2_Replacement_clean,     desc="L2 Replacement, but data is clean", format="!r";
+
+    // events from memory controller
+    Mem_Data,     desc="data from memory", format="!r";
+    Mem_Ack,     desc="ack from memory", format="!r";
+
+    // M->S data writeback
+    WB_Data,  desc="data from L1";
+    WB_Data_clean,  desc="clean data from L1";
+    Ack,      desc="writeback ack";
+    Ack_all,      desc="writeback ack";
+
+    Unblock, desc="Unblock from L1 requestor";
+    Exclusive_Unblock, desc="Unblock from L1 requestor";
+
+    MEM_Inv, desc="Invalidation from directory";
+
+    // FalseSharing:  Additional support GlobalAccess State update
+    UP_MD,    desc="update access metadata send by a core";
+    UP_All,   desc="Metadata received by last sharer/current owner";
+    MD_WT,    desc="Metadata sync to perform privatization check for block";  
+    UP_DMD,    desc="dummy access MD control msg send by a core";
+    UP_DAll, desc="metadata update from last sharer/current owner";
+    UP_EMD, desc="Metadata by core for an evicted block";
+  }
+
+  // TYPES
+
+  // CacheEntry
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,          desc="cache state";
+    NetDest Sharers,               desc="tracks the L1 shares on-chip";
+    MachineID Exclusive,          desc="Exclusive holder of block";
+    DataBlock DataBlk,       desc="data for the block";
+    bool Dirty, default="false", desc="data is dirty";
+    bool isPrivatized, default="false", desc="TRUE if block is privatised";  // FalseSharing: Additional field to mark privatized block
+    int pendingMDCount, default="0", desc="pending ACK for the block"; // FalseSharing: manages inflight metadata  response
+    int fetchCounter, default="0", desc="Track the number of fetch request to the block"; // FalseSharing: total fetch request
+    int invalCounter, default="0", desc="Track the number of invalidation and intervention for the block"; // FalseSharing: total invalidation request
+    int hysteresisCounter, default="0", desc="prevent the frequent initiation and termination of privatization"; // FalseSharing:
+  }
+
+  // TBE fields
+  structure(TBE, desc="...") {
+    Addr addr,            desc="Physical address for this TBE";
+    State TBEState,             desc="Transient state";
+    DataBlock DataBlk,          desc="Buffer for the data block";
+    bool Dirty, default="false", desc="Data is Dirty";
+
+    NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
+    MachineID L1_GetX_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
+    int pendingAcks,            desc="number of pending acks for invalidates during writeback";
+    // FalseSharing: Real system request contains only actual address
+    // FalseSharing: Number of bytes requested , do not consider in overhead
+    int Len, default="1", desc="number of bytes requested";
+    Addr PhyAddress, desc="addr requested by instr ";
+    bool isPrivatized; // FalseSharing: denote TBE entry for privatized block
+    MachineID pendingRequestor, desc="To store id of requestor triggering privatization";
+    int pendingMDCount, default="0", desc="store the number of pending MD to receive";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<L2Cache_TBE>", constructor="m_number_of_TBEs";
+
+  Tick clockEdge();
+  Tick cyclesToTicks(Cycles c);
+  Cycles ticksToCycles(Tick t);
+
+  void set_cache_entry(AbstractCacheEntry a);
+  void unset_cache_entry();
+  void set_tbe(TBE a);
+  void unset_tbe();
+  void wakeUpBuffers(Addr a);
+  void profileMsgDelay(int virtualNetworkType, Cycles c);
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+  // inclusive cache, returns L2 entries only
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    return static_cast(Entry, "pointer", L2cache[addr]);
+  }
+
+  bool isSharer(Addr addr, MachineID requestor, Entry cache_entry) {
+    if (is_valid(cache_entry)) {
+      return cache_entry.Sharers.isElement(requestor);
+    } else {
+      return false;
+    }
+  }
+
+  void addSharer(Addr addr, MachineID requestor, Entry cache_entry) {
+    assert(is_valid(cache_entry));
+    DPRINTF(RubySlicc, "machineID: %s, requestor: %s, address: %#x\n",
+            machineID, requestor, addr);
+    cache_entry.Sharers.add(requestor);
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if(is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:NP;
+  }
+
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    // MUST CHANGE
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (is_valid(cache_entry)) {
+      cache_entry.CacheState := state;
+    }
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      DPRINTF(RubySlicc, "%s\n", L2Cache_State_to_permission(tbe.TBEState));
+      return L2Cache_State_to_permission(tbe.TBEState);
+    }
+
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      DPRINTF(RubySlicc, "%s\n", L2Cache_State_to_permission(cache_entry.CacheState));
+      return L2Cache_State_to_permission(cache_entry.CacheState);
+    }
+
+    DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+    return AccessPermission:NotPresent;
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      testAndRead(addr, getCacheEntry(addr).DataBlk, pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+        testAndWrite(addr, tbe.DataBlk, pkt);
+      return num_functional_writes;
+    }
+
+    num_functional_writes := num_functional_writes +
+        testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+    return num_functional_writes;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(L2Cache_State_to_permission(state));
+    }
+  }
+
+  Event L1Cache_request_type_to_event(CoherenceRequestType type, Addr addr,
+                                      MachineID requestor, Entry cache_entry) {
+    if(type == CoherenceRequestType:GETS) {
+      return Event:L1_GETS;
+    } else if(type == CoherenceRequestType:GET_INSTR) {
+      return Event:L1_GET_INSTR;
+    } else if (type == CoherenceRequestType:GETX) {
+      return Event:L1_GETX;
+    } else if (type == CoherenceRequestType:UPGRADE) {
+      if ( is_valid(cache_entry) && cache_entry.Sharers.isElement(requestor) ) {
+        return Event:L1_UPGRADE;
+      } else {
+        return Event:L1_GETX;
+      }
+    } else if (type == CoherenceRequestType:PUTX) {
+      if (isSharer(addr, requestor, cache_entry)) {
+        return Event:L1_PUTX;
+      } else {
+        return Event:L1_PUTX_old;
+      }
+    } else {
+      DPRINTF(RubySlicc, "address: %#x, Request Type: %s\n", addr, type);
+      error("Invalid L1 forwarded request type");
+    }
+  }
+
+  int getPendingAcks(TBE tbe) {
+    return tbe.pendingAcks;
+  }
+
+  bool isDirty(Entry cache_entry) {
+    assert(is_valid(cache_entry));
+    return cache_entry.Dirty;
+  }
+
+  // ** OUT_PORTS **
+
+  out_port(L1RequestL2Network_out, RequestMsg, L1RequestFromL2Cache);
+  out_port(DirRequestL2Network_out, RequestMsg, DirRequestFromL2Cache);
+  out_port(responseL2Network_out, ResponseMsg, responseFromL2Cache);
+
+
+  in_port(L1unblockNetwork_in, ResponseMsg, unblockToL2Cache, rank = 2) {
+    if(L1unblockNetwork_in.isReady(clockEdge())) {
+      peek(L1unblockNetwork_in,  ResponseMsg) {
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+        DPRINTF(RubySlicc, "Addr: %#x State: %s Sender: %s Type: %s Dest: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Sender, in_msg.Type, in_msg.Destination);
+
+        assert(in_msg.Destination.isElement(machineID));
+        if (in_msg.Type == CoherenceResponseType:EXCLUSIVE_UNBLOCK) {
+          trigger(Event:Exclusive_Unblock, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceResponseType:UNBLOCK) {
+          trigger(Event:Unblock, in_msg.addr, cache_entry, tbe);
+        } else {
+          error("unknown unblock message");
+        }
+      }
+    }
+  }
+
+
+  // Response L2 Network - response msg to this particular L2 bank
+  in_port(responseL2Network_in, ResponseMsg, responseToL2Cache, rank = 1) {
+    if (responseL2Network_in.isReady(clockEdge())) {
+      peek(responseL2Network_in, ResponseMsg) {
+        // test whether it's from a local L1 or an off chip source
+        assert(in_msg.Destination.isElement(machineID));
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+
+        if(machineIDToMachineType(in_msg.Sender) == MachineType:L1Cache) {
+          if(in_msg.Type == CoherenceResponseType:DATA) {
+            if (in_msg.Dirty) {
+              trigger(Event:WB_Data, in_msg.addr, cache_entry, tbe);
+            } else {
+              trigger(Event:WB_Data_clean, in_msg.addr, cache_entry, tbe);
+            }
+          } else if (in_msg.Type == CoherenceResponseType:ACK) {
+            if ((getPendingAcks(tbe) - in_msg.AckCount) == 0) {
+              trigger(Event:Ack_all, in_msg.addr, cache_entry, tbe);
+            } else {
+              trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
+            }
+          } else if(in_msg.Type == CoherenceResponseType:GA_OWA) {
+            if(getState(tbe, cache_entry, in_msg.addr) == State:MDW_M ||
+                getState(tbe, cache_entry, in_msg.addr) == State:MDW_S){
+              if(tbe.pendingMDCount > 1 ) {
+                DPRINTF(ProtocolTrace,"%s :pending count: %d\n",getState(tbe, cache_entry, in_msg.addr), tbe.pendingMDCount);
+                trigger(Event:UP_MD,in_msg.addr, cache_entry, tbe);
+              }else {
+                if(is_valid(cache_entry)) {
+                  cache_entry.pendingMDCount := 1;
+                }
+                trigger(Event:UP_All,in_msg.addr, cache_entry, tbe);
+              }
+            } else {
+              // FalseSharing: Does not require tbe lookup for metadata count update in detection
+              trigger(Event:UP_MD, in_msg.addr, cache_entry, tbe);
+            }
+          } else if(in_msg.Type == CoherenceResponseType:GA_DMD) { // FalseSharing: to process dummy MD message
+            if(getState(tbe, cache_entry, in_msg.addr) == State:MDW_M ||
+               getState(tbe, cache_entry, in_msg.addr) == State:MDW_S){
+              if(tbe.pendingMDCount > 1 ) {
+                trigger(Event:UP_DMD,in_msg.addr, cache_entry, tbe);
+              }else {
+                if(is_valid(cache_entry)) {
+                  cache_entry.pendingMDCount := 1;
+                }
+                trigger(Event:UP_DAll,in_msg.addr, cache_entry, tbe);
+              }
+            } else { 
+              trigger(Event:UP_DMD, in_msg.addr, cache_entry, tbe);
+            }
+          } else if (in_msg.Type == CoherenceResponseType:GA_OWE) {
+            trigger(Event:UP_EMD, in_msg.addr, cache_entry, tbe);
+          } else {
+            error("unknown message type");
+          }
+        } else { // external message
+          if(in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
+              trigger(Event:Mem_Data, in_msg.addr, cache_entry, tbe);
+          } else if(in_msg.Type == CoherenceResponseType:MEMORY_ACK) {
+              trigger(Event:Mem_Ack, in_msg.addr, cache_entry, tbe);
+          } else if(in_msg.Type == CoherenceResponseType:INV) {
+              trigger(Event:MEM_Inv, in_msg.addr, cache_entry, tbe);
+          } else {
+            error("unknown message type");
+          }
+        }
+      }
+    }  // if not ready, do nothing
+  }
+
+  // L1 Request
+  in_port(L1RequestL2Network_in, RequestMsg, L1RequestToL2Cache, rank = 0) {
+    if(L1RequestL2Network_in.isReady(clockEdge())) {
+      peek(L1RequestL2Network_in,  RequestMsg) {
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+
+        DPRINTF(RubySlicc, "Addr: %#x State: %s Req: %s Type: %s Dest: %s\n",
+                in_msg.addr, getState(tbe, cache_entry, in_msg.addr),
+                in_msg.Requestor, in_msg.Type, in_msg.Destination);
+
+        assert(machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache);
+        assert(in_msg.Destination.isElement(machineID));
+
+        if (is_valid(cache_entry)) {
+          // The L2 contains the block, so proceeded with handling the request
+          // FalseSharing: detect privatization only in stable state
+          //if((getState(tbe, cache_entry, in_msg.addr) == State:MT || getState(tbe, cache_entry, in_msg.addr) == State:M)
+            // ||
+            //((in_msg.Type == CoherenceRequestType:GETX || in_msg.Type == CoherenceRequestType:UPGRADE)
+            //  && getState(tbe, cache_entry, in_msg.addr) == State:SS)) {
+            
+          // FalseSharing: Detect where block can be mark private or not
+          if(cache_entry.isPrivatized == false
+                && cache_entry.invalCounter >= inv_threshold 
+                && cache_entry.fetchCounter >= fetch_threshold) {
+            // FalseSharing: sync any inflight metadata message
+            //if ((is_valid(tbe) && tbe.pendingMDCount >= 1) || cache_entry.pendingMDCount >= 1) {
+            //  trigger(Event:MD_WT, in_msg.addr,cache_entry,tbe);
+            //} else {
+              // FalseSharing: if all metadata up-to-date inform block has significant false sharing private
+              // continue baseline MESI
+              cache_entry.fetchCounter := 0;
+              cache_entry.invalCounter := 0;
+              if(cache_entry.hysteresisCounter == 0
+                && (FSGlobalACTData.checkTrueSharingBit(in_msg.addr) == false)) {
+                // checkPrivatizationStatus(in_msg.addr)
+                cache_entry.isPrivatized := true;
+              } else  {
+                // Either privatization does not materialize or hysteresis is non-zero
+                // FalseSharing: Decrement hysteresis count and reset FC and IC
+                if(cache_entry.hysteresisCounter > 0) {
+                  cache_entry.hysteresisCounter := cache_entry.hysteresisCounter - 1;
+                }
+              }
+              trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
+                                                in_msg.Requestor, cache_entry),
+                                                in_msg.addr, cache_entry, tbe);
+            //}
+          } else { // FalseSharing: block detected as falsely shared
+            trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
+                                                in_msg.Requestor, cache_entry),
+                                                in_msg.addr, cache_entry, tbe);
+          }
+          //} else { // FalseSharing: block in transient state
+            //trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
+            //                                    in_msg.Requestor, cache_entry),
+            //                                    in_msg.addr, cache_entry, tbe);
+          //}
+        } else {
+          if (L2cache.cacheAvail(in_msg.addr)) {
+            // L2 does't have the line, but we have space for it in the L2
+            trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
+                                                  in_msg.Requestor, cache_entry),
+                    in_msg.addr, cache_entry, tbe);
+          } else {
+            // No room in the L2, so we need to make room before handling the request
+            Addr victim := L2cache.cacheProbe(in_msg.addr);
+            Entry L2cache_entry := getCacheEntry(victim);
+            if(L2cache_entry.pendingMDCount > 0) {
+              DPRINTF(PrvDebug, "Block %#x with non-zero MD count is evicted\n",in_msg.addr);
+            }
+            if (isDirty(L2cache_entry)) {
+              trigger(Event:L2_Replacement, victim, L2cache_entry, TBEs[victim]);
+            } else {
+              trigger(Event:L2_Replacement_clean,
+                      victim, L2cache_entry, TBEs[victim]);
+            }
+          }
+        }
+      }
+    }
+  }
+
+
+  // ACTIONS
+
+  action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+      }
+    }
+  }
+
+  action(b_forwardRequestToExclusive, "b", desc="Forward request to the exclusive L1") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(L1RequestL2Network_out, RequestMsg, to_l1_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := in_msg.Type;
+        out_msg.Requestor := in_msg.Requestor;
+        out_msg.Destination.add(cache_entry.Exclusive);
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+
+        // FalseSharing : set metadata bit for block if not true sharing 
+        if (FSGlobalACTData.checkTrueSharingBit(in_msg.PhyAddress)) {
+            out_msg.requireMetadata := false;
+        } else {
+            out_msg.requireMetadata := true;
+            cache_entry.pendingMDCount := cache_entry.pendingMDCount + 1;         
+        }
+      }
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(c_exclusiveReplacement, "c", desc="Send data to memory") {
+    enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:MEMORY_DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.Dirty := cache_entry.Dirty;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  action(c_exclusiveCleanReplacement, "cc", desc="Send ack to memory for clean replacement") {
+    enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:ACK;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.MessageSize := MessageSizeType:Response_Control;
+    }
+  }
+
+  action(ct_exclusiveReplacementFromTBE, "ct", desc="Send data to memory") {
+    enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+      assert(is_valid(tbe));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:MEMORY_DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Dirty := tbe.Dirty;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  action(d_sendDataToRequestor, "d", desc="Send data from cache to reqeustor") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+
+        out_msg.AckCount := 0 - cache_entry.Sharers.count();
+        if (cache_entry.Sharers.isElement(in_msg.Requestor)) {
+          out_msg.AckCount := out_msg.AckCount + 1;
+        }
+        // FalseSharing: MD comm bit
+        if (FSGlobalACTData.checkTrueSharingBit(address)) {
+          out_msg.requireMetadata := false;
+        } else {
+          out_msg.requireMetadata := true;
+        }
+      }
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(dd_sendExclusiveDataToRequestor, "dd", desc="Send data from cache to reqeustor") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_EXCLUSIVE;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+
+        out_msg.AckCount := 0 - cache_entry.Sharers.count();
+        if (cache_entry.Sharers.isElement(in_msg.Requestor)) {
+          out_msg.AckCount := out_msg.AckCount + 1;
+        }
+        // FalseSharing: exclusive response
+        // disable metadata by default 
+        out_msg.requireMetadata := false;
+      }
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(ds_sendSharedDataToRequestor, "ds", desc="Send data from cache to reqeustor") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.AckCount := 0;
+        // FalseSharing: shared only block
+        out_msg.requireMetadata := false;
+      }
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(e_sendDataToGetSRequestors, "e", desc="Send data from cache to all GetS IDs") {
+    assert(is_valid(tbe));
+    assert(tbe.L1_GetS_IDs.count() > 0);
+    enqueue(responseL2Network_out, ResponseMsg, to_l1_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination := tbe.L1_GetS_IDs;  // internal nodes
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      // FalseSharing: set MD comm bit to false
+      out_msg.requireMetadata := false;
+    }
+  }
+
+  action(ex_sendExclusiveDataToGetSRequestors, "ex", desc="Send data from cache to all GetS IDs") {
+    assert(is_valid(tbe));
+    assert(tbe.L1_GetS_IDs.count() == 1);
+    enqueue(responseL2Network_out, ResponseMsg, to_l1_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA_EXCLUSIVE;
+      out_msg.Sender := machineID;
+      out_msg.Destination := tbe.L1_GetS_IDs;  // internal nodes
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+
+      // FalseSharing: set MD comm bit to false
+      out_msg.requireMetadata := false;
+    }
+  }
+
+  action(ee_sendDataToGetXRequestor, "ee", desc="Send data from cache to GetX ID") {
+    enqueue(responseL2Network_out, ResponseMsg, to_l1_latency) {
+      assert(is_valid(tbe));
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(tbe.L1_GetX_ID);
+      DPRINTF(RubySlicc, "%s\n", out_msg.Destination);
+      out_msg.DataBlk := cache_entry.DataBlk;
+      DPRINTF(RubySlicc, "Address: %#x, Destination: %s, DataBlock: %s\n",
+              out_msg.addr, out_msg.Destination, out_msg.DataBlk);
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+
+      // FalseSharing: set MD comm bit to false
+      out_msg.requireMetadata := false;
+    }
+  }
+
+  action(f_sendInvToSharers, "f", desc="invalidate sharers for L2 replacement") {
+    enqueue(L1RequestL2Network_out, RequestMsg, to_l1_latency) {
+      assert(is_valid(cache_entry));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:INV;
+      out_msg.Requestor := machineID;
+      out_msg.Destination := cache_entry.Sharers;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+      // FalseSharing: do not send metadata onn invalidation due to eviction
+      out_msg.requireMetadata := false;
+    }
+  }
+
+  // VIPIN: FalseSharing: The transition in unused in L2 cache by GEM5.
+  action(fw_sendFwdInvToSharers, "fw", desc="invalidate sharers for request") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(L1RequestL2Network_out, RequestMsg, to_l1_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:INV;
+        out_msg.Requestor := in_msg.Requestor;
+        out_msg.Destination := cache_entry.Sharers;
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+      }
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  // FalseSharing: also updates the MD count
+  action(fwm_sendFwdInvToSharersMinusRequestor, "fwm", desc="invalidate sharers for request, requestor is sharer") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(L1RequestL2Network_out, RequestMsg, to_l1_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:INV;
+        out_msg.Requestor := in_msg.Requestor;
+        out_msg.Destination := cache_entry.Sharers;
+        out_msg.Destination.remove(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        
+        // FalseSharing : set metadata bit for block if not true sharing
+        if (FSGlobalACTData.checkTrueSharingBit(in_msg.PhyAddress)) {
+          out_msg.requireMetadata := false;
+        } else {
+          out_msg.requireMetadata := true; // FalseSharing: update MD count
+          // FalseSharing: update MD count based on if sharer is requestor
+          cache_entry.pendingMDCount := cache_entry.pendingMDCount + cache_entry.Sharers.count();
+          // FalseSharing: if sharer is requestor,
+          if(is_valid(cache_entry) && cache_entry.Sharers.isElement(in_msg.Requestor)) {
+            cache_entry.pendingMDCount := cache_entry.pendingMDCount - 1;
+          }
+        }
+      }
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  // OTHER ACTIONS
+  action(i_allocateTBE, "i", desc="Allocate TBE for request") {
+    check_allocate(TBEs);
+    assert(is_valid(cache_entry));
+    TBEs.allocate(address);
+    set_tbe(TBEs[address]);
+    tbe.L1_GetS_IDs.clear();
+    tbe.DataBlk := cache_entry.DataBlk;
+    tbe.Dirty := cache_entry.Dirty;
+    tbe.pendingAcks := cache_entry.Sharers.count();
+    tbe.isPrivatized := cache_entry.isPrivatized; // FalseSharing: record privatization status to TBE.
+    // FalseSharing: tbe allocate on first request to block or replacement
+    // TODO: decide can we ignore MD message for a block 
+    tbe.pendingMDCount := cache_entry.pendingMDCount;
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  action(jj_popL1RequestQueue, "\j", desc="Pop incoming L1 request queue") {
+    Tick delay := L1RequestL2Network_in.dequeue(clockEdge());
+    profileMsgDelay(0, ticksToCycles(delay));
+  }
+
+  action(k_popUnblockQueue, "k", desc="Pop incoming unblock queue") {
+    Tick delay := L1unblockNetwork_in.dequeue(clockEdge());
+    profileMsgDelay(0, ticksToCycles(delay));
+  }
+
+  action(o_popIncomingResponseQueue, "o", desc="Pop Incoming Response queue") {
+    Tick delay := responseL2Network_in.dequeue(clockEdge());
+    profileMsgDelay(1, ticksToCycles(delay));
+  }
+
+  action(m_writeDataToCache, "m", desc="Write data from response queue to cache") {
+    peek(responseL2Network_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk;
+      if (in_msg.Dirty) {
+        cache_entry.Dirty := in_msg.Dirty;
+      }
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Sender);
+    }
+  }
+
+  action(mr_writeDataToCacheFromRequest, "mr", desc="Write data from response queue to cache") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      if (in_msg.Dirty) {
+        cache_entry.DataBlk := in_msg.DataBlk;
+        cache_entry.Dirty := in_msg.Dirty;
+      }
+    }
+  }
+
+  action(q_updateAck, "q", desc="update pending ack count") {
+    peek(responseL2Network_in, ResponseMsg) {
+      assert(is_valid(tbe));
+      tbe.pendingAcks := tbe.pendingAcks - in_msg.AckCount;
+      APPEND_TRANSITION_COMMENT(in_msg.AckCount);
+      APPEND_TRANSITION_COMMENT(" p: ");
+      APPEND_TRANSITION_COMMENT(tbe.pendingAcks);
+    }
+  }
+
+  action(qq_writeDataToTBE, "\qq", desc="Write data from response queue to TBE") {
+    peek(responseL2Network_in, ResponseMsg) {
+      assert(is_valid(tbe));
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.Dirty := in_msg.Dirty;
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Sender);
+    }
+  }
+
+  action(ss_recordGetSL1ID, "\s", desc="Record L1 GetS for load response") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(tbe));
+      // FalseSharing: used for marking exclusive owner
+      // on first GETS request for a block
+      if(tbe.L1_GetS_IDs.count() == 0) {
+        tbe.pendingRequestor := in_msg.Requestor;
+      }
+      tbe.L1_GetS_IDs.add(in_msg.Requestor);
+    }
+  }
+
+  action(xx_recordGetXL1ID, "\x", desc="Record L1 GetX for store response") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(tbe));
+      tbe.L1_GetX_ID := in_msg.Requestor;
+    }
+  }
+
+  action(set_setMRU, "\set", desc="set the MRU entry") {
+    L2cache.setMRU(address);
+  }
+
+  action(qq_allocateL2CacheBlock, "\q", desc="Set L2 cache tag equal to tag of block B.") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L2cache.allocate(address, new Entry));
+    }
+  }
+
+  action(rr_deallocateL2CacheBlock, "\r", desc="Deallocate L2 cache block.  Sets the cache to not present, allowing a replacement in parallel with a fetch.") {
+    L2cache.deallocate(address);
+    unset_cache_entry();
+  }
+
+  action(t_sendWBAck, "t", desc="Send writeback ACK") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(responseL2Network_out, ResponseMsg, to_l1_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:WB_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(ts_sendInvAckToUpgrader, "ts", desc="Send ACK to upgrader") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      enqueue(responseL2Network_out, ResponseMsg, to_l1_latency) {
+        assert(is_valid(cache_entry));
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        // upgrader doesn't get ack from itself, hence the + 1
+        out_msg.AckCount := 0 - cache_entry.Sharers.count() + 1;
+        APPEND_TRANSITION_COMMENT(" Sharers :");
+        APPEND_TRANSITION_COMMENT(cache_entry.Sharers.count());
+      }
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(uu_profileMiss, "\um", desc="Profile the demand miss") {
+      ++L2cache.demand_misses;
+  }
+
+  action(uu_profileHit, "\uh", desc="Profile the demand hit") {
+      ++L2cache.demand_hits;
+  }
+
+  action(nn_addSharer, "\n", desc="Add L1 sharer to list") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      addSharer(address, in_msg.Requestor, cache_entry);
+      APPEND_TRANSITION_COMMENT( cache_entry.Sharers );
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(nnu_addSharerFromUnblock, "\nu", desc="Add L1 sharer to list") {
+    peek(L1unblockNetwork_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      addSharer(address, in_msg.Sender, cache_entry);
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Sender);
+    }
+  }
+
+  action(kk_removeRequestSharer, "\k", desc="Remove L1 Request sharer from list") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.Sharers.remove(in_msg.Requestor);
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+  }
+
+  action(ll_clearSharers, "\l", desc="Remove all L1 sharers from list") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.Sharers.clear();
+    }
+  }
+
+  action(mm_markExclusive, "\m", desc="set the exclusive owner") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.Sharers.clear();
+      cache_entry.Exclusive := in_msg.Requestor;
+      addSharer(address, in_msg.Requestor, cache_entry);
+    }
+  }
+
+  action(mmu_markExclusiveFromUnblock, "\mu", desc="set the exclusive owner") {
+    peek(L1unblockNetwork_in, ResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.Sharers.clear();
+      cache_entry.Exclusive := in_msg.Sender;
+      addSharer(address, in_msg.Sender, cache_entry);
+      // FalseSharing:
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Sender);
+    }
+  }
+
+  action(zz_stallAndWaitL1RequestQueue, "zz", desc="recycle L1 request queue") {
+    // FalseSharing: added before action
+    // require peek to obtain Requestor ID
+    peek(L1RequestL2Network_in,  RequestMsg) {
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Requestor);
+    }
+    stall_and_wait(L1RequestL2Network_in, address);
+  }
+
+  action(zn_recycleResponseNetwork, "zn", desc="recycle memory request") {
+    responseL2Network_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
+  }
+
+  action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
+    wakeUpBuffers(address);
+  }
+
+  // FalseSharing: mark exclusive owner in IM>MT transition
+  //Earlier Exclusive owner marked based on unblock sender
+  action(mxt_markExclusiveFromTBE, "\mxt", desc="set the exclusive owner") {
+    assert(is_valid(cache_entry));
+    assert(is_valid(tbe));
+    cache_entry.Sharers.clear();
+    cache_entry.Exclusive := tbe.L1_GetX_ID;
+    addSharer(address, tbe.L1_GetX_ID, cache_entry);
+  }
+
+  // FalseSharing: mark exclusive owner in ISS>MT transition
+  //Earlier Exclusive owner marked based on unblock sender
+  action(mxt_markExclFromTBEGETS, "\mxs", desc="set the exclusive owner using GETS field") {
+    assert(is_valid(cache_entry));
+    assert(is_valid(tbe));
+    cache_entry.Sharers.clear();
+    cache_entry.Exclusive := tbe.pendingRequestor;
+    addSharer(address, tbe.pendingRequestor, cache_entry);
+  }
+
+  // FalseSharing: Allocation of new access metadata entry in the Global Access tracking
+  action(fs_allocateGAEntry,"aoga", desc="allocate new entry in Global Acc table") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      if (in_msg.Type == CoherenceRequestType:GETS) {
+        FSGlobalACTData.setFSGAEntry(in_msg.PhyAddress, in_msg.Len, in_msg.Requestor, true);
+      } else if (in_msg.Type == CoherenceRequestType:GETX || in_msg.Type == CoherenceRequestType:UPGRADE) {
+        FSGlobalACTData.setFSGAEntry(in_msg.PhyAddress, in_msg.Len, in_msg.Requestor, false);
+      }
+    }
+  }
+  // FalseSharing: Deallocate a global access tracking entry
+  action(fs_deallocateGAEntry, "dega", desc="deallocate an existing entry from table") {
+    FSGlobalACTData.removeFSGAEntry(address);
+  }
+
+  // FalseSharing: Update the access metadata for the byte offset
+  action(fs_updateGAEntry,"upga", desc="update a existing entry ") {
+    peek(responseL2Network_in, ResponseMsg) {
+      FSGlobalACTData.updateFSGAEntry(address, in_msg.OptionalAccessMetadata, in_msg.Sender);
+      APPEND_TRANSITION_COMMENT(" Sender : ");
+      APPEND_TRANSITION_COMMENT(in_msg.Sender);
+    }
+  }
+
+  // FalseSharing: action to update invalidation count
+  action(fs_updateInvCount, "uic", desc="update the num of invalidation for block") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      DPRINTF(GlobalAccess,"Updating Inv count by %d  for %#x.\n", cache_entry.Sharers.count(), address);
+      if (is_valid(cache_entry) && cache_entry.Sharers.isElement(in_msg.Requestor)) {
+        cache_entry.invalCounter := cache_entry.invalCounter + cache_entry.Sharers.count() - 1;
+      } else {
+        cache_entry.invalCounter := cache_entry.invalCounter + cache_entry.Sharers.count();
+      }
+    }
+  }
+
+  //FalseSharing: action to update invalidation count from modified state
+  action(fs_updateInvalidationM, "uicm", desc="update invalidation for fetch request ") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      DPRINTF(GlobalAccess,"Updating Inv count by 1 for %#x.\n", address);
+      cache_entry.invalCounter := cache_entry.invalCounter + 1;
+    }
+  }
+
+  // FalseSharing: action to update fetch count for block
+  action(fs_updateFetchCount, "ufc", desc="update the num of fetch for block") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      DPRINTF(GlobalAccess,"Updating Fetch count for block: %#x :: %#x.\n", in_msg.addr, address);
+      cache_entry.fetchCounter := cache_entry.fetchCounter+1;
+    }
+  }
+
+  // FalseSharing: Decrement the total number of pending MD response by 1
+  action(fs_decrementMDCount,"dmc",desc="decrement or keep metadata count unchanged") {
+    //peek(responseL2Network_in, ResponseMsg) {
+      APPEND_TRANSITION_COMMENT("PendingMDCount: ");
+      if(is_valid(tbe) && tbe.pendingMDCount >= 1) {
+        tbe.pendingMDCount := tbe.pendingMDCount - 1;
+        APPEND_TRANSITION_COMMENT(tbe.pendingMDCount);
+        APPEND_TRANSITION_COMMENT(" ");
+      }
+      if(is_valid(cache_entry) && cache_entry.pendingMDCount >= 1) {
+        cache_entry.pendingMDCount := cache_entry.pendingMDCount - 1;
+        APPEND_TRANSITION_COMMENT(cache_entry.pendingMDCount);
+      }
+      APPEND_TRANSITION_COMMENT("\n");
+    //}
+  }
+
+  // FalseSharing: MD update are clubbed with invalidation and intervention request
+
+  // FalseSharing: modify the allocate TBE to store MD count before triggering privatization
+  // FalseSharing: syncup pending metadata before initiating privatization
+  // FalseSharing: we can limit to hold only pendingMD count other info not required now
+  action(m_tbeMD, "tm", desc="Allocate TBE for MD count ") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      check_allocate(TBEs);
+      assert(is_valid(cache_entry));
+      TBEs.allocate(address);
+      set_tbe(TBEs[address]);
+      tbe.L1_GetS_IDs.clear();
+      tbe.DataBlk := cache_entry.DataBlk;
+      tbe.Dirty := cache_entry.Dirty;
+      tbe.isPrivatized := cache_entry.isPrivatized; // FalseSharing: copy privatization status to TBE.
+      tbe.pendingMDCount := cache_entry.pendingMDCount;
+      if(in_msg.Type == CoherenceRequestType:GETX || in_msg.Type ==CoherenceRequestType:UPGRADE) {
+        tbe.L1_GetS_IDs.clear();
+        tbe.L1_GetX_ID :=  in_msg.Requestor;
+      }else if (in_msg.Type == CoherenceRequestType:GETS || in_msg.Type ==CoherenceRequestType:GET_INSTR) {
+        tbe.L1_GetS_IDs.clear();
+        tbe.L1_GetS_IDs.add(in_msg.Requestor);
+      }
+      tbe.pendingRequestor := in_msg.Requestor;
+      tbe.Len := in_msg.Len;
+      tbe.PhyAddress := in_msg.PhyAddress;
+    }
+  }
+
+  // FalseSharing: update the metadata msg count
+  action(fs_incrMetadataMsg, "imm", desc="Profile the metadata msg") {
+    ++FSGlobalACTData.metadata_msg;
+    //FSGlobalACTData.incrMDCount();
+  }
+
+  // FalseSharing: update the metadata msg count
+  action(fs_incrCtrlMetadataMsg, "icm", desc="Profile the control(dummy) metadata msg") {
+    ++FSGlobalACTData.control_metadata_msg;
+    //FSGlobalACTData.incrControlMDCount();
+  }
+
+  // FalseSharing: update the total metadata msg
+  action(fs_incrTotalMetadataMsg, "itm", desc="Profile the metadata msg") {
+    ++FSGlobalACTData.total_metadata_msg;
+    //FSGlobalACTData.incrTotalMDCount();
+  }
+
+  // FalseSharing: update the eviction metadata msg count
+  action(fs_incrEvcMetadataMsg, "iem", desc="Profile the eviction metadata msg") {
+    ++FSGlobalACTData.eviction_metadata_msg;
+  }
+
+  // FalseSharing: ack eviction MD 
+  action(fs_ackEvictionMD, "aem", desc= "acknowledge the sender for MD on eviction") {
+    peek(responseL2Network_in, ResponseMsg) {
+      enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:EMD_ACK;
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
+  // FalseSharing: update hysteresis counter only if true sharing bit is set 
+  action(fs_incrementHysteresisCounter, "ihc", desc="increment hysteresis counter") {
+    assert(is_valid(cache_entry));
+    if (cache_entry.hysteresisCounter < hys_threshold) {
+      cache_entry.hysteresisCounter := cache_entry.hysteresisCounter + 2;
+    }
+  }
+
+  // FalseSharing: update hysteresis counter 
+  action(fs_decrementHysteresisCounter, "dhc", desc="decrement hysteresis counter") {
+    assert(is_valid(cache_entry));
+    cache_entry.hysteresisCounter := cache_entry.hysteresisCounter - 1;
+  }
+
+  //*****************************************************
+  // TRANSITIONS
+  //*****************************************************
+
+
+  //===============================================
+  // BASE STATE - I
+
+  // Transitions from I (Idle)
+  transition({NP, IS, ISS, IM, SS, M, M_I, I_I, S_I, MT_IB, MT_SB}, L1_PUTX) {
+    t_sendWBAck;
+    jj_popL1RequestQueue;
+  }
+
+  transition({NP, SS, M, MT, M_I, I_I, S_I, IS, ISS, IM, MT_IB, MT_SB}, L1_PUTX_old) {
+    t_sendWBAck;
+    jj_popL1RequestQueue;
+  }
+
+  transition({IM, IS, ISS, SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB}, {L2_Replacement, L2_Replacement_clean}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition({IM, IS, ISS, SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB}, MEM_Inv) {
+    zn_recycleResponseNetwork;
+  }
+
+  transition({I_I, S_I, M_I, MT_I, MCT_I, NP}, MEM_Inv) {
+    o_popIncomingResponseQueue;
+  }
+
+  transition({SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB}, {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition(NP, L1_GETS,  ISS) {
+    fs_allocateGAEntry; // FalseSharing:
+    qq_allocateL2CacheBlock;
+    ll_clearSharers;
+    nn_addSharer;
+    i_allocateTBE;
+    ss_recordGetSL1ID;
+    fs_updateFetchCount; // FalseSharing: update fetch count for block
+    a_issueFetchToMemory;
+    uu_profileMiss;
+    jj_popL1RequestQueue;
+  }
+
+  transition(NP, L1_GET_INSTR, IS) {
+    fs_allocateGAEntry; // FalseSharing:
+    qq_allocateL2CacheBlock;
+    ll_clearSharers;
+    nn_addSharer;
+    i_allocateTBE;
+    ss_recordGetSL1ID;
+    fs_updateFetchCount; // FalseSharing: update fetch count for block
+    a_issueFetchToMemory;
+    uu_profileMiss;
+    jj_popL1RequestQueue;
+  }
+
+  // FalseSharing: PhysicalAddress and Len field will be lost at end of transition
+  // FalseSharing: Allocate  Global Access entry here, fetch count is also maitained in
+  transition(NP, L1_GETX, IM) {
+    fs_allocateGAEntry; // FalseSharing:
+    qq_allocateL2CacheBlock;
+    ll_clearSharers;
+    fs_updateFetchCount; // FalseSharing: Update fetch count for block
+    // nn_addSharer;
+    i_allocateTBE;
+    xx_recordGetXL1ID;
+    a_issueFetchToMemory;
+    uu_profileMiss;
+    jj_popL1RequestQueue;
+  }
+
+
+  // transitions from IS/IM
+
+  // FalseSharing: send exclusive data and make requestor owner
+  transition(ISS, Mem_Data, MT) {
+    m_writeDataToCache;
+    ex_sendExclusiveDataToGetSRequestors;
+    mxt_markExclFromTBEGETS;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(IS, Mem_Data, SS) {
+    m_writeDataToCache;
+    e_sendDataToGetSRequestors;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  // FalseSharing: IM > MT, first GETX to block
+  //
+  transition(IM, Mem_Data, MT) {
+    m_writeDataToCache;
+    ee_sendDataToGetXRequestor;
+    mxt_markExclusiveFromTBE; // FalseSharing: marking block exclusive owner using TBE
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents; // FalseSharing: some request could be stall during IM state
+  }
+
+  transition({IS, ISS}, {L1_GETS, L1_GET_INSTR}, IS) {
+    nn_addSharer;
+    ss_recordGetSL1ID;
+    fs_updateFetchCount; // FalseSharing: Update fetch count
+    uu_profileMiss;
+    jj_popL1RequestQueue;
+  }
+
+  transition({IS, ISS}, L1_GETX) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition(IM, {L1_GETX, L1_GETS, L1_GET_INSTR}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  // transitions from SS
+  transition(SS, {L1_GETS, L1_GET_INSTR}) {
+    ds_sendSharedDataToRequestor;
+    fs_updateFetchCount; // FalseSharing: Update fetch count
+    nn_addSharer;
+    set_setMRU;
+    uu_profileHit;
+    jj_popL1RequestQueue;
+  }
+
+  // FalseSharing: Transition for unblocking getx
+  transition(SS, L1_GETX, MT) {
+    d_sendDataToRequestor;
+    fs_updateFetchCount; // FalseSharing:
+    fs_updateInvCount; // FalseSharing:
+    fwm_sendFwdInvToSharersMinusRequestor;
+    // FalseSharing: Marking exclusive owner before sending invalidation deadlocks protocol
+    mm_markExclusive; // FalseSharing: to set the owner of block
+    set_setMRU;
+    uu_profileHit;
+    jj_popL1RequestQueue;
+  }
+
+
+  // FalseSharing: Transition for unblocking upgrade
+  transition(SS, L1_UPGRADE, MT) {
+    fs_updateFetchCount; // FalseSharing:
+    fs_updateInvCount; // FalseSharing:
+
+    fwm_sendFwdInvToSharersMinusRequestor;
+    ts_sendInvAckToUpgrader;
+    mm_markExclusive; // Set owner of block
+    set_setMRU;
+    uu_profileHit;
+    jj_popL1RequestQueue;
+  }
+
+  transition(SS, L2_Replacement_clean, I_I) {
+    i_allocateTBE;
+    f_sendInvToSharers;
+    fs_deallocateGAEntry; // FalseSharing: Block is replaced, evict MD
+    rr_deallocateL2CacheBlock;
+  }
+
+  // FalseSharing: Replacement does not require invalidation count updates
+  transition(SS, {L2_Replacement, MEM_Inv}, S_I) {
+    i_allocateTBE;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+  }
+
+  // FalseSharing: non blocking transition
+  transition(M, L1_GETX, MT) {
+    d_sendDataToRequestor;
+    fs_updateFetchCount; // FalseSharing:
+    mm_markExclusive; // FalseSharing:
+    set_setMRU;
+    uu_profileHit;
+    jj_popL1RequestQueue;
+  }
+
+  transition(M, L1_GET_INSTR, SS) {
+    d_sendDataToRequestor;
+    fs_updateFetchCount; // FalseSharing:
+    nn_addSharer;
+    set_setMRU;
+    uu_profileHit;
+    jj_popL1RequestQueue;
+  }
+
+  // FalseSharing: first getS request for block own by LLC
+  transition(M, L1_GETS, MT) {
+    dd_sendExclusiveDataToRequestor;
+    fs_updateFetchCount; // FalseSharing:
+    mm_markExclusive;
+    set_setMRU;
+    uu_profileHit;
+    jj_popL1RequestQueue;
+  }
+
+  // FalseSharing: block only in L2 cache
+  transition(M, {L2_Replacement, MEM_Inv}, M_I) {
+    i_allocateTBE;
+    c_exclusiveReplacement;
+    rr_deallocateL2CacheBlock;
+  }
+
+  transition(M, L2_Replacement_clean, M_I) {
+    i_allocateTBE;
+    c_exclusiveCleanReplacement;
+    rr_deallocateL2CacheBlock;
+  }
+
+
+  // transitions from MT
+
+  transition(MT, L1_GETX, MT_MB) {
+    b_forwardRequestToExclusive;
+    fs_updateFetchCount; // FalseSharing:
+    fs_updateInvalidationM; // FalseSharing:
+    uu_profileMiss;
+    set_setMRU;
+    jj_popL1RequestQueue;
+  }
+
+
+  transition(MT, {L1_GETS, L1_GET_INSTR}, MT_IIB) {
+    b_forwardRequestToExclusive;
+    fs_updateFetchCount; // FalseSharing:
+    fs_updateInvalidationM; // FalseSharing:
+    uu_profileMiss;
+    set_setMRU;
+    jj_popL1RequestQueue;
+  }
+
+  transition(MT, {L2_Replacement, MEM_Inv}, MT_I) {
+    i_allocateTBE;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+  }
+
+  transition(MT, L2_Replacement_clean, MCT_I) {
+    i_allocateTBE;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+  }
+
+  transition(MT, L1_PUTX, M) {
+    ll_clearSharers;
+    mr_writeDataToCacheFromRequest;
+    t_sendWBAck;
+    jj_popL1RequestQueue;
+  }
+
+  // FalseSharing: Removed SS_MB
+  transition(MT_MB, Exclusive_Unblock, MT) {
+    // update actual directory
+    mmu_markExclusiveFromUnblock;
+    k_popUnblockQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(MT_IIB, {L1_PUTX, L1_PUTX_old}){
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition(MT_IIB, Unblock, MT_IB) {
+    nnu_addSharerFromUnblock;
+    k_popUnblockQueue;
+  }
+
+  transition(MT_IIB, {WB_Data, WB_Data_clean}, MT_SB) {
+    m_writeDataToCache;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(MT_IB, {WB_Data, WB_Data_clean}, SS) {
+    m_writeDataToCache;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(MT_SB, Unblock, SS) {
+    nnu_addSharerFromUnblock;
+    k_popUnblockQueue;
+    kd_wakeUpDependents;
+  }
+
+  // writeback states
+  transition({I_I, S_I, MT_I, MCT_I, M_I}, {L1_GETX, L1_UPGRADE, L1_GETS, L1_GET_INSTR}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition(I_I, Ack) {
+    q_updateAck;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(I_I, Ack_all, M_I) {
+    c_exclusiveCleanReplacement;
+    o_popIncomingResponseQueue;
+  }
+
+  transition({MT_I, MCT_I}, WB_Data, M_I) {
+    qq_writeDataToTBE;
+    ct_exclusiveReplacementFromTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(MCT_I, {WB_Data_clean, Ack_all}, M_I) {
+    c_exclusiveCleanReplacement;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(MCT_I,  {L1_PUTX, L1_PUTX_old}){
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  // L1 never changed Dirty data
+  transition(MT_I, {WB_Data_clean, Ack_all}, M_I) {
+    ct_exclusiveReplacementFromTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(MT_I, {L1_PUTX, L1_PUTX_old}){
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  // possible race between unblock and immediate replacement
+  //transition({MT_MB,SS_MB}, {L1_PUTX, L1_PUTX_old}) {
+  //  zz_stallAndWaitL1RequestQueue;
+  //}
+
+  // FalseSharing: Remove SS_MB state
+  transition({MT_MB}, {L1_PUTX, L1_PUTX_old}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition(S_I, Ack) {
+    q_updateAck;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(S_I, Ack_all, M_I) {
+    ct_exclusiveReplacementFromTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(M_I, Mem_Ack, NP) {
+    fs_deallocateGAEntry; // FalseSharing:
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  // FalseSharing: Update the Own-Access MD
+  // The L1 cache controller responds with access metadata.
+  transition({NP, IS, ISS, IM, SS, M, M_I, I_I, S_I, MT_IB, MT_SB, MCT_I, SS_MB, MT_MB, MT_I, MT_IIB, MT},UP_MD) {
+    fs_updateGAEntry;
+    fs_incrMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    o_popIncomingResponseQueue;
+  }
+
+  // FalseSharing: Dummy metadata update
+  transition({NP,IS, ISS, IM, SS, M, M_I, I_I, S_I, MT_IB, MT_SB, MCT_I, SS_MB, MT_MB, MT_I, MT_IIB, MT, MDW_M, MDW_S},UP_DMD) {
+    fs_incrCtrlMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    o_popIncomingResponseQueue;
+  }
+
+  // FalseSharing: LD/ST for a block in  metadata sync transient state
+  transition({MDW_M, MDW_S}, {L1_GETX, L1_UPGRADE, L1_GETS, L1_GET_INSTR, L2_Replacement, L2_Replacement_clean}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition({MDW_M,MDW_S}, UP_MD) {
+    fs_incrMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    fs_updateGAEntry;
+    o_popIncomingResponseQueue;
+  }
+
+  // FalseSharing: Transition to tackle inflight MD message
+  transition(MT, MD_WT, MDW_M) {
+    // FalseSharing:  action required as the owner can access new byte therefore require updated metadata
+    m_tbeMD;
+    zz_stallAndWaitL1RequestQueue;
+  }
+  // FalseSharing: unused if not using the pendingMDcount
+  transition(SS, MD_WT, MDW_S) {
+    m_tbeMD;
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  // FalseSharing: Last metadata update for block
+  transition(MDW_M, UP_All,  MT) {
+    fs_incrMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    s_deallocateTBE;
+    fs_updateGAEntry;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents; // FalseSharing: multiple request will be stalled
+  }
+
+  // FalseSharing: unused as not using pendingMDcount
+  transition(MDW_S, UP_All, SS) {
+    fs_incrMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    s_deallocateTBE;
+    fs_updateGAEntry;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents; // FalseSharing: multiple request will be stalled
+  }
+
+  // FalseSharing: write back from a core update cache block
+  transition({MDW_M,MDW_S},WB_Data) {
+    m_writeDataToCache;
+    qq_writeDataToTBE;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(MDW_M, UP_DAll, MT){
+    fs_incrCtrlMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents; // FalseSharing: multiple request will be stalled
+  }
+
+  // FalseSharing: unused as not using pendingMDcount
+  transition(MDW_S, UP_DAll, SS) {
+    fs_incrCtrlMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_decrementMDCount;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents; // FalseSharing: multiple request will be stalled
+  }
+
+  transition({IS, ISS, IM, SS, M_I, I_I, S_I, MT_IB, MT_SB, MCT_I, SS_MB, MT_MB, MT_I, MT_IIB, MT, NP, M}, UP_EMD) {
+    fs_ackEvictionMD;
+    fs_incrEvcMetadataMsg;
+    fs_incrTotalMetadataMsg;
+    fs_updateGAEntry;
+    o_popIncomingResponseQueue
+  }
+
+}

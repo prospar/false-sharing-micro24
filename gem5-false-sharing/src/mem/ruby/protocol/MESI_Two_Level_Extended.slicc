@@ -1,0 +1,7 @@
+protocol "MESI_Two_Level_Extended";
+include "RubySlicc_interfaces.slicc";
+include "MESI_Two_Level_Extended-msg.sm";
+include "MESI_Two_Level_Extended-L1cache.sm";
+include "MESI_Two_Level_Extended-L2cache.sm";
+include "MESI_Two_Level_Extended-dir.sm";
+include "MESI_Two_Level_Extended-dma.sm";
