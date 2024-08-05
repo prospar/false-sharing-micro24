@@ -174,12 +174,12 @@ BaseSimpleCPU::countInst()
     t_info.numOp++;
     t_info.numOps++;
     // FalseSharing: logging info about completed instrution every 10M ticks
-    if (curTick()%10000000 == 0) {
-        TheISA::PCState pc = threadContexts[curThread]->pcState();
-        Addr instAddr = pc.instAddr();
-        //inform("Thread %d in Committed Inst %#x at\
-                Tick %lld", curThread, instAddr, curTick());
-    }
+    // if (curTick()%10000000 == 0) {
+    //     TheISA::PCState pc = threadContexts[curThread]->pcState();
+    //     Addr instAddr = pc.instAddr();
+    //     inform("Thread %d in Committed Inst %#x at\
+    //            Tick %lld", curThread, instAddr, curTick());
+    // }
 
 }
 
