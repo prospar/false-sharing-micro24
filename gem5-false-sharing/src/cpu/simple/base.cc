@@ -177,7 +177,7 @@ BaseSimpleCPU::countInst()
     // if (curTick()%10000000 == 0) {
     //     TheISA::PCState pc = threadContexts[curThread]->pcState();
     //     Addr instAddr = pc.instAddr();
-    //     inform("Thread %d in Committed Inst %#x at\
+    //     inform("Thread %d in Committed Inst %#x at
     //            Tick %lld", curThread, instAddr, curTick());
     // }
 
