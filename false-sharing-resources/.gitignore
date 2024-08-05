@@ -1,0 +1,7 @@
+false-sharing-resources/*.pyc
+false-sharing-resources/src/parsec/disk-image/parsec-image
+false-sharing-resources/src/parsec/packer*
+false-sharing-resources/m5out/
+false-sharing-resources/src/linux-kernel/vmlinux*
+false-sharing-resources/nohup.out
+false-sharing-resources/disk-images/*
