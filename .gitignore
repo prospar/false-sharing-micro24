@@ -50,3 +50,9 @@ false-sharing-resources/m5out/
 false-sharing-resources/src/linux-kernel/vmlinux*
 false-sharing-resources/nohup.out
 false-sharing-resources/disk-images/*
+
+# gitignore for false-sharing-benchmarks
+*.vscode
+false-sharing-benchmarks/build
+false-sharing-benchmarks/benchmarks/synchrobench/c-cpp/bin
+false-sharing-benchmarks/benchmarks/synchrobench/c-cpp/build

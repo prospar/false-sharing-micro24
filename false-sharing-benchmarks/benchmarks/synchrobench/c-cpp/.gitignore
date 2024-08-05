@@ -1,0 +1,10 @@
+bin/*
+build/*
+test.sh
+test.out
+test.tbl
+*swp
+core*
+output*
+log
+data
