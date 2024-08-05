@@ -1,4 +1,0 @@
-Executing Histogram :
-./histogram <input_file> <iteration_count>
-
-<gem5_binary> <options> <system_script> --options="input_file iteration_count"
