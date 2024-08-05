@@ -232,7 +232,7 @@ LDFLAGS += -lpthread
 # https://stackoverflow.com/questions/12054858/add-so-and-a-libraries-to-makefile
 # https://stackoverflow.com/questions/2826029/passing-additional-variables-from-command-line-to-make
 ifdef CUSTOM_HOOK
-  M5_PATH?=/home/vipin/false-sharing-benchmarks
+  M5_PATH?=/home/prospar/micro-virtualenv/false-sharing-micro24/false-sharing-benchmarks
   export M5_PATH
   CFLAGS += -I${M5_PATH}/m5_library -DROI_TRACING
   LDFLAGS += -L${M5_PATH}/build/m5_library -llibhooks_prospar

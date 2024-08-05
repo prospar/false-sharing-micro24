@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(false-sharing-benchmarks LANGUAGES C CXX ASM)
 
 if(${SE_MODE})
-    set(GEM5_PATH "/data/vipinpat/GEM5-FS/gem5-false-sharing" CACHE PATH "path to gem5 directory source to include m5")
+    set(GEM5_PATH "/home/prospar/micro-virtualenv/false-sharing-micro24/gem5-false-sharing" CACHE PATH "path to gem5 directory source to include m5")
     add_definitions(-DSE_MODE_BUILD)
 endif()
 
